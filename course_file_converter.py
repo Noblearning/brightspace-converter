@@ -1,19 +1,19 @@
 """
-Word → Brightspace HTML Converter  +  Padlet → Word Converter
+Word to Brightspace HTML Converter  +  Padlet to Word Converter
 ──────────────────────────────────────────────────────────────
 Three-tab GUI:
   • Convert      — file picker, output options, live preview (HTML source / rendered)
   • Settings     — element transform dropdowns, blockquote HR toggle, CSS upload
-  • Padlet → Word — curriculum-map markdown + Word template → populated .docx
+  • Padlet to Word — curriculum-map markdown + Word template to populated .docx
 
 Accordion detection: a single-cell Word table whose cell contains one or more
-H4 paragraphs is treated as an accordion group.  Each H4 → card title; the
-normal paragraphs that follow it (until the next H4 or end of cell) → card body.
+H4 paragraphs is treated as an accordion group.  Each H4 to card title; the
+normal paragraphs that follow it (until the next H4 or end of cell) to card body.
 """
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-import json, re, tempfile, webbrowser, shutil, subprocess, sys, zipfile, threading
+import json, re, tempfile, webbrowser, shutil, subprocess, sys, zipfile, threading, html as _html
 try:
     import requests
     from bs4 import BeautifulSoup
@@ -199,7 +199,7 @@ from docx.oxml.ns import qn
 
 
 # ═══════════════════════════════════════════════════════════════
-#  PADLET → WORD  CONVERSION LOGIC  (non-GUI)
+#  PADLET to WORD  CONVERSION LOGIC  (non-GUI)
 #  Ported from padlet_to_docx.py — all GUI removed, pure logic.
 # ═══════════════════════════════════════════════════════════════
 
@@ -225,6 +225,7 @@ class _Para:
     list_type:   object = None
     list_level:  int = 0
     list_number: object = None
+    comment:     str  = ""  # Word comment to attach to this paragraph
 
     def plain_text(self):
         return "".join(s.text for s in self.spans)
@@ -316,7 +317,10 @@ class _HTMLToParas(HTMLParser):
             self._href = ""
 
     def handle_data(self, data):
-        self._add_span(data.replace("\xa0", " "))
+        # Normalize non-breaking spaces and collapse double spaces
+        text = data.replace("\xa0", " ")
+        text = re.sub(r"  +", " ", text)
+        self._add_span(text)
 
     def handle_entityref(self, name):
         ch = {"amp":"&","lt":"<","gt":">","nbsp":" ","quot":'"',"apos":"'"}.get(name,"")
@@ -334,11 +338,30 @@ class _HTMLToParas(HTMLParser):
         return [p for p in self._paras if p.plain_text().strip()]
 
 
+def _p_collapse_inter_span_spaces(paras):
+    """Collapse double-spaces that span adjacent _Span boundaries within a _Para.
+
+    e.g. _Span("word ") + _Span(" next") -> _Span("word ") + _Span("next")
+    We do this by ensuring no span starts with a space when the previous span
+    already ends with one.
+    """
+    for para in paras:
+        spans = para.spans
+        for i in range(1, len(spans)):
+            prev, cur = spans[i - 1], spans[i]
+            if prev.text.endswith(" ") and cur.text.startswith(" "):
+                spans[i] = _Span(
+                    text=cur.text.lstrip(" "),
+                    bold=cur.bold, italic=cur.italic, href=cur.href)
+    return paras
+
+
 def _p_html_to_paras(html):
     if not html or not html.strip():
         return []
     p = _HTMLToParas(); p.feed(html)
-    return p.result()
+    result = p.result()
+    return _p_collapse_inter_span_spaces(result)
 
 
 _P_MOD_RE    = re.compile(r"^## Module \d+:\s*(.+)", re.MULTILINE)
@@ -365,10 +388,243 @@ def _p_resolve_padlet_url(url):
 _YT_RE = re.compile(
     r"(?:youtube\.com/(?:watch\?v=|shorts/)|youtu\.be/)([\w-]{11})")
 
+# Injected once per page when at least one video embed is present
+VIDEO_WRAP_CSS = """\
+<style>
+.video-wrap{position:relative;padding-bottom:56.25%;height:0;overflow:hidden;margin:1em 0}
+.video-wrap iframe{position:absolute;top:0;left:0;width:100%;height:100%;border:0}
+</style>"""
+
+_YT_SENTINEL_RE = re.compile(r"\[\[YT:([\w-]{11})\]\]")
+
+
+def _make_video_iframe(vid_id):
+    embed_url = f"https://www.youtube-nocookie.com/embed/{vid_id}"
+    return (
+        f'<div class="video-wrap">'
+        f'<iframe src="{embed_url}" '
+        f'title="YouTube video player" '
+        f'allow="accelerometer; autoplay; clipboard-write; '
+        f'encrypted-media; gyroscope; picture-in-picture" '
+        f'allowfullscreen></iframe>'
+        f'</div>'
+    )
+
+# Matches title separators: " - ", " | ", " – ", " — " (spaced),
+# and tight "|" with no surrounding spaces (common on government sites)
+_TITLE_SEP_RE = re.compile(r" (?:[-–—]|\|) ?|(?<=[^\s])\|(?=[^\s])")
+
+
+def _p_clean_url(url):
+    """Decode HTML entities and normalise YouTube URLs to canonical form.
+
+    - HTML entities: &amp; -> & etc.
+    - YouTube: strips timestamps/tracking -> https://youtube.com/watch?v=ID
+    - youtu.be short URLs -> canonical long form
+    - SafeLinks (Outlook): unwrap to the original destination URL
+    """
+    url = _html.unescape(url.strip())
+    # Unwrap Microsoft SafeLinks (can01/nam01/etc.safelinks.protection.outlook.com)
+    if "safelinks.protection.outlook.com" in url:
+        try:
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+            inner = qs.get("url", [None])[0]
+            if inner:
+                url = urllib.parse.unquote(inner)
+        except Exception:
+            pass
+    m = _YT_RE.search(url)
+    if m:
+        return f"https://www.youtube.com/watch?v={m.group(1)}"
+    return url
+
+
+# Title-case helper used when formatting resource citations
+def _p_title_case(s):
+    """Apply title case to a resource title, cleaning leading/trailing noise
+    punctuation and preserving short all-caps acronyms (e.g. UDL, TMU, OCT)."""
+    s = re.sub(r"^[\s.:*]+|[\s.:*]+$", "", s)
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    if not s:
+        return s
+    LOWER_WORDS = frozenset({"a", "an", "the", "and", "but", "or", "for", "nor",
+                             "on", "at", "to", "by", "in", "of", "up", "as",
+                             "is", "it", "its"})
+    tokens = re.findall(r"[\w']+|[^\w']", s)
+    word_idx = 0
+    out = []
+    for tok in tokens:
+        if not re.match(r"[\w']", tok):
+            out.append(tok)
+            continue
+        w = tok
+        is_acronym = (w.isupper() and w.isalpha() and 2 <= len(w) <= 5
+                      and w.lower() not in LOWER_WORDS)
+        if is_acronym:
+            out.append(w)
+        elif word_idx == 0 or w.lower() not in LOWER_WORDS:
+            out.append(w[0].upper() + w[1:].lower())
+        else:
+            out.append(w.lower())
+        word_idx += 1
+    return re.sub(r"^[\s.:*]+|[\s.:*]+$", "", "".join(out)).strip()
+
+
+# File-hosting / generic "cloud drive" domains that should not be used as the
+# site/publisher in a resource citation (real publisher is unknown from the URL).
+_GENERIC_HOST_SITES = frozenset({
+    "google docs", "google drive", "dropbox", "onedrive", "sharepoint",
+    "box", "icloud drive",
+})
+
+TRACKING_PARAMS = ("utm_", "gclid=", "fbclid=", "mc_cid=", "mc_eid=")
+
+
+def _p_has_tracking(url):
+    s = url.lower()
+    return any(t in s for t in TRACKING_PARAMS)
+
+
+def _p_validate_url(url):
+    """HEAD (with GET fallback) check. Returns (status_code, comment_text_or_None).
+
+    Mirrors the VBA bucket logic:
+      200              -> None (clean)
+      301/302/307/308  -> redirect comment
+      403              -> access-restricted comment
+      0 (error/timeout)-> inconclusive comment
+      other 4xx/5xx   -> broken comment
+    Tracking params append an extra note when present.
+    """
+    if not _REQUESTS_OK:
+        return 0, None
+    code = 0
+    try:
+        r = requests.head(url, timeout=8, allow_redirects=False,
+                          headers={"User-Agent": "Mozilla/5.0"})
+        code = r.status_code
+        if code in (405, 400, 501):
+            r2 = requests.get(url, timeout=8, allow_redirects=False,
+                              headers={"User-Agent": "Mozilla/5.0"}, stream=True)
+            r2.close()
+            code = r2.status_code
+            if code == 206:
+                code = 200
+    except requests.exceptions.Timeout:
+        code = 0
+    except Exception:
+        code = 0
+
+    is_redirect   = code in (301, 302, 303, 307, 308)
+    # PDFs served directly (e.g. .pdf URLs) often block HEAD/GET from scripts
+    # but open fine in a browser — treat as openable rather than restricted.
+    is_pdf_url    = url.lower().split("?")[0].endswith(".pdf")
+    is_restricted = code == 403 and not is_pdf_url
+    is_ok         = code == 200 or (code == 403 and is_pdf_url)
+    is_inconc     = code == 0
+    is_broken     = not (is_ok or is_redirect or is_restricted or is_inconc)
+    has_tracking  = _p_has_tracking(url)
+
+    notes = []
+    if is_broken:
+        notes.append(
+            "Link appears broken and contains tracking parameters – search for an "
+            "updated URL before publishing." if has_tracking else
+            "Link appears broken – search for an updated or replacement URL before publishing.")
+    else:
+        if is_redirect:
+            notes.append("Redirected URL – locate and update to the final destination "
+                         "URL before publishing.")
+        if is_restricted:
+            notes.append("Access restricted – open in a browser to confirm the link "
+                         "works before publishing.")
+        if is_inconc:
+            notes.append("Could not be verified – open in a browser to confirm the "
+                         "link works before publishing.")
+        if has_tracking:
+            notes.append("Contains tracking parameters – consider removing them for "
+                         "a cleaner URL before publishing.")
+
+    return code, " ".join(notes) if notes else None
+
+
+# ── Word comment writer ───────────────────────────────────────────────────────
+
+_COMMENTS_XML_TEMPLATE = (
+    b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+    b'<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" ' +
+    b'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"/>')
+
+
+def _p_get_comments_el(doc):
+    """Return the lxml w:comments element, creating the part if needed."""
+    from docx.opc.part import Part
+    from docx.opc.constants import RELATIONSHIP_TYPE as RT
+    from docx.opc.packuri import PackURI
+    try:
+        return doc.part._comments_part._element
+    except AttributeError:
+        part = Part(
+            PackURI("/word/comments.xml"),
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml",
+            _COMMENTS_XML_TEMPLATE,
+            doc.part.package)
+        doc.part.relate_to(part, RT.COMMENTS)
+        return doc.part._comments_part._element
+
+
+def _p_attach_comment(doc, para_el, comment_text):
+    """Attach a Word comment bubble to the first run in para_el."""
+    if not comment_text:
+        return
+    comments_el = _p_get_comments_el(doc)
+    cid = str(len(comments_el.findall(qn("w:comment"))))
+
+    # Build w:comment element
+    c = OxmlElement("w:comment")
+    c.set(qn("w:id"), cid)
+    c.set(qn("w:author"), "Converter")
+    c.set(qn("w:date"), "2026-01-01T00:00:00Z")
+    c.set(qn("w:initials"), "CV")
+    cp_ = OxmlElement("w:p")
+    cr_ = OxmlElement("w:r")
+    ct_ = OxmlElement("w:t")
+    ct_.text = comment_text
+    ct_.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+    cr_.append(ct_); cp_.append(cr_); c.append(cp_)
+    comments_el.append(c)
+
+    # Anchor: wrap first run in commentRangeStart/End + commentReference
+    runs = para_el.findall(qn("w:r"))
+    # Also check inside w:hyperlink children
+    if not runs:
+        for hl in para_el.findall(qn("w:hyperlink")):
+            runs = hl.findall(qn("w:r"))
+            if runs:
+                para_el = hl  # attach inside the hyperlink element
+                break
+    if not runs:
+        return
+
+    target_run = runs[0]
+    crs = OxmlElement("w:commentRangeStart"); crs.set(qn("w:id"), cid)
+    target_run.addprevious(crs)
+    cre = OxmlElement("w:commentRangeEnd");   cre.set(qn("w:id"), cid)
+    target_run.addnext(cre)
+    ref_r = OxmlElement("w:r")
+    rpr = OxmlElement("w:rPr")
+    rs = OxmlElement("w:rStyle"); rs.set(qn("w:val"), "CommentReference")
+    rpr.append(rs); ref_r.append(rpr)
+    ref = OxmlElement("w:commentReference"); ref.set(qn("w:id"), cid)
+    ref_r.append(ref)
+    cre.addnext(ref_r)
+
+
 def _fetch_youtube_meta(url, api_key=None):
     """Return dict with title, channel, duration_str, year (best-effort)."""
     if not _REQUESTS_OK:
         return {}
+    url = _p_clean_url(url)
     vid_m = _YT_RE.search(url)
     if not vid_m:
         return {}
@@ -427,6 +683,17 @@ def _fetch_page_meta(url):
             tag = soup.find("meta", attrs={"name": name})
             return tag["content"].strip() if tag and tag.get("content") else None
 
+        def _jld_value(v):
+            """Resolve a JSON-LD value to a plain string, handling dicts and lists."""
+            if isinstance(v, dict):
+                return v.get("name") or v.get("@id") or ""
+            if isinstance(v, list):
+                first = v[0] if v else None
+                if isinstance(first, dict):
+                    return first.get("name") or first.get("@id") or ""
+                return str(first) if first else ""
+            return str(v)
+
         def json_ld(field):
             for tag in soup.find_all("script", type="application/ld+json"):
                 try:
@@ -434,26 +701,89 @@ def _fetch_page_meta(url):
                     items = data if isinstance(data, list) else [data]
                     for item in items:
                         if field in item:
-                            v = item[field]
-                            return v.get("name") if isinstance(v, dict) else str(v)
+                            return _jld_value(item[field])
                         for sub in item.get("@graph", []):
                             if field in sub:
-                                v = sub[field]
-                                return v.get("name") if isinstance(v, dict) else str(v)
+                                return _jld_value(sub[field])
                 except Exception:
                     pass
             return None
 
-        title  = og("title") or (
-            soup.title.string.split("|")[0].split("\u2013")[0].strip()
-            if soup.title else None)
-        site   = og("site_name") or json_ld("publisher")
-        author = meta_name("author") or json_ld("author")
+        def og_prop(prop):
+            """Read any <meta property="..."> tag, not just og:* ones."""
+            tag = soup.find("meta", property=prop)
+            return tag["content"].strip() if tag and tag.get("content") else None
+
+        def strip_byline(s):
+            return re.sub(r"^[Bb]y\s+", "", s).strip() if s else s
+
+        # Split <title> on common separators to get page title and site name
+        raw_title = soup.title.string.strip() if soup.title else ""
+        if raw_title:
+            sep_m = _TITLE_SEP_RE.search(raw_title)
+            if sep_m:
+                title_from_tag = raw_title[:sep_m.start()].strip().rstrip(":").strip()
+                site_from_tag  = raw_title[sep_m.end():].strip()
+            else:
+                title_from_tag = raw_title
+                site_from_tag  = None
+        else:
+            title_from_tag = None
+            site_from_tag  = None
+
+        # Apply separator-split to og:title too — many sites embed " - SiteName"
+        # in og:title even when og:site_name is absent.  Split it and use the
+        # prefix as the clean title; the suffix becomes a site_name candidate.
+        og_title_raw  = og("title") or ""
+        og_site_extra = None
+        if og_title_raw:
+            og_sep = _TITLE_SEP_RE.search(og_title_raw)
+            if og_sep:
+                og_title_clean = og_title_raw[:og_sep.start()].strip().rstrip(":").strip()
+                og_site_extra  = og_title_raw[og_sep.end():].strip()
+            else:
+                og_title_clean = og_title_raw
+        else:
+            og_title_clean = None
+
+        title  = og_title_clean or title_from_tag
+        site   = og("site_name") or json_ld("publisher") or og_site_extra or site_from_tag
+        # DC.creator may be semicolon-separated (take first name only)
+        dc_creator = meta_name("DC.creator") or meta_name("dc.creator")
+        if dc_creator:
+            dc_creator = dc_creator.split(";")[0].strip()
+
+        # editor fallback: used by PressBooks edited volumes
+        editor = json_ld("editor")
+        if editor:
+            editor = editor + " (Ed.)"
+
+        author = (
+            meta_name("author")
+            or strip_byline(meta_name("byl"))
+            or og_prop("article:author")
+            or json_ld("author")
+            or dc_creator
+            or editor
+        )
         mod    = (meta_name("article:modified_time") or json_ld("dateModified") or "")[:4]
         pub    = (meta_name("article:published_time") or json_ld("datePublished") or "")[:4]
-        year   = mod or pub or None
+        # Dublin Core fallback (common on government/institutional sites)
+        dc     = (meta_name("DC.date") or meta_name("dc.date") or
+                  meta_name("dcterms.modified") or meta_name("dcterms.created") or "")[:4]
+        # Last-Modified HTTP response header as final fallback
+        lm     = (r.headers.get("Last-Modified", "") or "")[:4]
+        # Year embedded in the URL path as final fallback (e.g. /2018/01/)
+        url_year_m = re.search(r"/(20\d{2})/", url)
+        url_year   = url_year_m.group(1) if url_year_m else ""
+        # Keep only plausible 4-digit years
+        year   = next((y for y in (mod, pub, dc, lm, url_year)
+                       if y and y.isdigit() and 1990 <= int(y) <= 2099), None)
         if author and site and author.strip().lower() == site.strip().lower():
             author = None
+        # Suppress generic file-hosting sites (Google Docs, Dropbox, etc.)
+        if site and site.strip().lower() in _GENERIC_HOST_SITES:
+            site = None
         return {k: v for k, v in
                 {"title": title, "site": site, "author": author, "year": year}.items()
                 if v}
@@ -464,26 +794,31 @@ def _fetch_page_meta(url):
 def _p_format_resource_spans(url, meta, is_youtube):
     """Return a list of _Span objects for a formatted citation."""
     if is_youtube:
-        title    = meta.get("title", "") or url
-        channel  = meta.get("channel", "")
+        title    = _p_title_case(meta.get("title", "") or url)
+        channel  = re.sub(r"  +", " ", meta.get("channel", "")).strip()
         duration = meta.get("duration", "?:??")
-        year     = meta.get("year", "????")
-        suffix   = f" ({duration}) from {channel} ({year})."
+        year     = meta.get("year", "")
+        # Build suffix; omit date entirely when unknown
+        date_part = f" ({year})" if year else ""
+        suffix    = re.sub(r"  +", " ", f" ({duration}) from {channel}{date_part}.").strip()
+        suffix    = " " + suffix
         return [_Span(text="Watch ", bold=True),
                 _Span(text=title, href=url),
                 _Span(text=suffix)]
     else:
-        title  = meta.get("title", "") or url
+        title  = _p_title_case(meta.get("title", "") or url)
         site   = meta.get("site", "")
         author = meta.get("author", "")
-        year   = meta.get("year", "n.d.")
+        year   = meta.get("year", "")   # empty string = no date found
         parts  = []
         if author: parts.append(f"by {author}")
         if site:   parts.append(f"from {site}")
-        parts.append(f"({year}).")
+        if year:   parts.append(f"({year}).")
+        suffix = (" " + " ".join(parts)) if parts else ""
+        suffix = re.sub(r"  +", " ", suffix)
         return [_Span(text="Read ", bold=True),
                 _Span(text=title, href=url),
-                _Span(text=" " + " ".join(parts))]
+                _Span(text=suffix)]
 
 
 def _p_display_text_for_url(url):
@@ -553,36 +888,132 @@ def _p_classify(title, color):
 
 
 def _p_collect_links(paras, attachment_urls):
-    seen = set(); links = []
+    """Return (links, link_texts) where link_texts maps URL -> original display text."""
+    seen = set(); links = []; link_texts = {}
     for p in paras:
         for span in p.spans:
-            if span.href and span.href not in seen:
-                seen.add(span.href); links.append(span.href)
+            if span.href:
+                clean = _p_clean_url(span.href)
+                span.href = clean  # normalise in-place
+                if clean not in seen:
+                    seen.add(clean); links.append(clean)
+                    # Preserve the Padlet hyperlink display text for plain-link fallback
+                    if span.text and span.text.strip():
+                        link_texts[clean] = span.text.strip()
     for url in attachment_urls:
-        if url and url not in seen:
-            seen.add(url); links.append(url)
-    return links
+        if url:
+            clean = _p_clean_url(url)
+            if clean not in seen:
+                seen.add(clean); links.append(clean)
+    return links, link_texts
 
 
-def _p_hoist_links(paras, links, api_key=None, fetch_meta=False):
+def _p_hoist_links(paras, links, link_texts=None, api_key=None, fetch_meta=False, validate_links=False):
+    """Build resource paragraphs from collected links and prepend them to paras.
+
+    When 2+ consecutive items share the same verb ("Read" / "Watch"), they are
+    grouped under a single "Read the following:" / "Watch the following:" header
+    with each item indented and without a trailing period — as requested.
+    Plain-link fallbacks (access-denied, PDFs, no metadata) use the original
+    Padlet hyperlink display text rather than a raw URL.
+    """
     if not links: return paras
+    if link_texts is None:
+        link_texts = {}
     label_para = _Para()
     label_para.spans.append(_Span(text="Resources:", bold=True))
-    url_paras = []
+
+    # ── Step 1: build a raw list of (verb, para, comment) tuples ─────────────
+    # verb is "Read", "Watch", or "" (plain / attachment)
+    raw_items = []   # list of (verb: str, para: _Para, comment: str|None)
     for url in links:
         p = _Para()
         is_attachment = ("storage.googleapis.com" in url or "padlet-uploads" in url)
         is_youtube    = bool(_YT_RE.search(url))
+        comment = None
+        verb = ""
+
         if fetch_meta and not is_attachment and _REQUESTS_OK:
             meta = (_fetch_youtube_meta(url, api_key=api_key)
                     if is_youtube else _fetch_page_meta(url))
             if meta.get("title"):
-                p.spans.extend(_p_format_resource_spans(url, meta, is_youtube))
-                url_paras.append(p)
+                spans = _p_format_resource_spans(url, meta, is_youtube)
+                p.spans.extend(spans)
+                if validate_links and not is_attachment:
+                    _, comment = _p_validate_url(url)
+                p.comment = comment
+                # Detect verb from the bold leading span
+                verb = spans[0].text.strip().rstrip() if spans else ""
+                raw_items.append((verb, p, comment))
                 continue
-        display = _p_display_text_for_url(url)
-        p.spans.append(_Span(text=display, href=url))
-        url_paras.append(p)
+
+        # Plain hyperlink fallback
+        display = link_texts.get(url) or _p_display_text_for_url(url)
+        if is_attachment:
+            # Attachment — no verb prefix, just the filename/link
+            p.spans.append(_Span(text=display, href=url))
+            verb = ""
+        elif is_youtube:
+            # YouTube link without meta — prefix "Watch " bold + plain hyperlink
+            p.spans.append(_Span(text="Watch ", bold=True))
+            p.spans.append(_Span(text=display, href=url))
+            verb = "Watch "
+        else:
+            # Regular link without meta — prefix "Read " bold + plain hyperlink
+            p.spans.append(_Span(text="Read ", bold=True))
+            p.spans.append(_Span(text=display, href=url))
+            verb = "Read "
+        if validate_links and not is_attachment:
+            _, comment = _p_validate_url(url)
+        p.comment = comment
+        raw_items.append((verb, p, comment))
+
+    # ── Step 2: group consecutive same-verb items (Read / Watch) ─────────────
+    url_paras = []
+    i = 0
+    while i < len(raw_items):
+        verb, p, comment = raw_items[i]
+        # Collect a run of items with the same non-empty groupable verb
+        if verb in ("Read ", "Watch "):
+            run = [(p, comment)]
+            j = i + 1
+            while j < len(raw_items) and raw_items[j][0] == verb:
+                run.append((raw_items[j][1], raw_items[j][2]))
+                j += 1
+            if len(run) == 1:
+                # Single item — emit as-is (verb already embedded in spans)
+                url_paras.append(p)
+            else:
+                # Multiple items — emit header then indented items without verb/period
+                header = _Para()
+                header.spans.append(_Span(
+                    text=f"{verb.strip()} the following:", bold=True))
+                url_paras.append(header)
+                for item_p, item_comment in run:
+                    # Strip the leading verb span and trailing period from suffix
+                    spans = item_p.spans
+                    # spans[0] is bold "Read " / "Watch ", spans[1] is the link,
+                    # spans[2] (if present) is the suffix text " by ... (year)."
+                    new_spans = []
+                    for k, s in enumerate(spans):
+                        if k == 0 and s.text.strip() in ("Read", "Watch"):
+                            continue          # drop verb
+                        if k == len(spans) - 1 and not s.href:
+                            # Suffix — strip trailing period
+                            new_spans.append(_Span(
+                                text=s.text.rstrip().rstrip("."),
+                                bold=s.bold, italic=s.italic, href=s.href))
+                        else:
+                            new_spans.append(s)
+                    indented = _Para(list_type="indent")
+                    indented.spans = new_spans
+                    indented.comment = item_comment
+                    url_paras.append(indented)
+            i = j
+        else:
+            url_paras.append(p)
+            i += 1
+
     return [label_para] + url_paras + paras
 
 
@@ -590,12 +1021,56 @@ def _p_extract_list_paras(paras):
     return [p for p in paras if p.list_type in ("ul","ol") and p.plain_text().strip()]
 
 
-def p_parse_markdown(md_path, api_key=None, fetch_meta=False):
+def _p_extract_course_name(raw):
+    """Parse the Padlet H1 title into a formatted course name.
+
+    e.g. "Teaching LGBTQ Students CONT 807 course planner"
+      -> "CONT807: Teaching LGBTQ Students"
+    """
+    m = re.match(r"^#\s+(.+)$", raw.splitlines()[0].strip())
+    if not m:
+        return None
+    title = m.group(1).strip()
+    # Match "DEPT 123" or "DEPT123" code anywhere in the title
+    code_m = re.search(r"\b([A-Z]{2,6})\s*(\d{3,4})\b", title)
+    if not code_m:
+        return None
+    code = code_m.group(1) + code_m.group(2)   # e.g. "CONT807"
+    # Remove the code (with optional surrounding spaces) from the title
+    remainder = title[:code_m.start()] + title[code_m.end():]
+    # Strip trailing noise words ("course planner", "course outline", etc.)
+    remainder = re.sub(
+        r"\b(course\s+)?(planner|outline|map|template|plan)\b", "", remainder,
+        flags=re.IGNORECASE)
+    remainder = re.sub(r"\s{2,}", " ", remainder).strip().strip("-–—,. ")
+    return f"{code}: {remainder}"
+
+
+def p_parse_markdown(md_path, api_key=None, fetch_meta=False,
+                     strip_brackets=False, include_attachments=True,
+                     import_course_name=False, validate_links=False):
     with open(md_path, encoding="utf-8") as f:
         raw = f.read()
 
     warnings = []
-    result = {"course_objectives":[], "course_culminating":None, "modules":[]}
+    course_name = _p_extract_course_name(raw) if import_course_name else None
+
+    if strip_brackets:
+        # Strip [bracketed notes] from body text, but NOT from ### heading lines
+        # so that markers like "[See Earlier Note]" on card headings are preserved
+        # (they control the parse-time skip logic in _p_classify).
+        def _strip_brackets_body(text):
+            lines_out = []
+            for ln in text.splitlines():
+                if ln.lstrip().startswith("### "):
+                    lines_out.append(ln)   # keep card heading lines intact
+                else:
+                    lines_out.append(re.sub(r"\[[^\]\n]{1,120}\](?!\()", "", ln))
+            return "\n".join(lines_out)
+        raw = _strip_brackets_body(raw)
+
+    result = {"course_objectives":[], "course_culminating":None,
+              "modules":[], "course_name": course_name}
     current_module = None
 
     for section in re.split(r"\n---\n", raw):
@@ -621,23 +1096,23 @@ def p_parse_markdown(md_path, api_key=None, fetch_meta=False):
         if kind == "skip": continue
 
         html_body   = _p_get_html_body(lines)
-        attachments = _p_get_attachments(lines)
+        attachments = _p_get_attachments(lines) if include_attachments else []
         paras       = _p_html_to_paras(html_body)
-        links       = _p_collect_links(paras, attachments)
+        links, link_texts = _p_collect_links(paras, attachments)
         clean       = _p_clean_title(h3_raw)
 
         if kind == "course_obj":
             result["course_objectives"] = _p_extract_list_paras(paras)
         elif kind == "course_culm":
-            paras = _p_hoist_links(paras, links, api_key=api_key, fetch_meta=fetch_meta)
+            paras = _p_hoist_links(paras, links, link_texts=link_texts, api_key=api_key, fetch_meta=fetch_meta, validate_links=validate_links)
             result["course_culminating"] = {"title":clean,"paras":paras}
         elif kind == "mod_obj" and current_module is not None:
             current_module["objectives"] = _p_extract_list_paras(paras)
         elif kind == "mod_culm" and current_module is not None:
-            paras = _p_hoist_links(paras, links, api_key=api_key, fetch_meta=fetch_meta)
+            paras = _p_hoist_links(paras, links, link_texts=link_texts, api_key=api_key, fetch_meta=fetch_meta, validate_links=validate_links)
             current_module["module_culminating"] = {"title":clean,"paras":paras}
         elif kind in ("task","task_intro") and current_module is not None:
-            paras = _p_hoist_links(paras, links, api_key=api_key, fetch_meta=fetch_meta)
+            paras = _p_hoist_links(paras, links, link_texts=link_texts, api_key=api_key, fetch_meta=fetch_meta, validate_links=validate_links)
             current_module["tasks"].append({"title":clean,"paras":paras,"is_intro":kind=="task_intro"})
         elif current_module is None and kind not in ("course_obj","course_culm"):
             warnings.append(f"Card '{h3_raw[:60]}' appears before any module heading — skipped.")
@@ -755,7 +1230,12 @@ def _p_clone_numbering_id(doc, abstract_num_id):
 
 def _p_build_para_xml(para, bullet_id, numbered_id, doc_part):
     new_p = OxmlElement("w:p"); pPr = OxmlElement("w:pPr")
-    if para.list_type is not None:
+    if para.list_type == "indent":
+        # Indented plain paragraph (no bullet/number) — used for "Read/Watch
+        # the following:" sub-items.  360 twips ≈ 0.25 in indent.
+        ps = OxmlElement("w:pStyle"); ps.set(qn("w:val"),"Normal"); pPr.append(ps)
+        ind = OxmlElement("w:ind"); ind.set(qn("w:left"),"360"); pPr.append(ind)
+    elif para.list_type is not None:
         ps = OxmlElement("w:pStyle"); ps.set(qn("w:val"),"ListParagraph"); pPr.append(ps)
         numPr = OxmlElement("w:numPr")
         ilvl  = OxmlElement("w:ilvl");  ilvl.set(qn("w:val"),str(para.list_level)); numPr.append(ilvl)
@@ -1083,11 +1563,20 @@ def p_execute_operations(doc, ops, warnings):
     # Pass 2a: fill_body — reverse order
     fill_ops = [op for op in ops if op.kind == "fill_body"]
     for op in sorted(fill_ops, key=lambda o: o.data["heading_idx"], reverse=True):
-        rich  = build_rich(op.data["paras"])
-        if not rich: continue
+        rich_paras = op.data["paras"]
+        rich  = build_rich(rich_paras)
         h_el  = op.data.get("heading_el")
         if h_el is None: h_el = paras[op.data["heading_idx"]]._element
         body_el = op.data.get("body_el")
+        if not rich:
+            # No content to insert — but still remove the template placeholder body
+            # so text like "Leave this blank." does not remain in the output.
+            if body_el is not None and body_el.getparent() is not None:
+                if not _p_has_page_break(body_el):
+                    body_el.getparent().remove(body_el)
+                else:
+                    _p_strip_para_text_el(body_el)
+            continue
         if body_el is not None and body_el.getparent() is not None:
             if _p_has_page_break(body_el):
                 insert_after(h_el, rich); _p_strip_para_text_el(body_el)
@@ -1095,6 +1584,12 @@ def p_execute_operations(doc, ops, warnings):
                 insert_after(body_el, rich); body_el.getparent().remove(body_el)
         else:
             insert_after(h_el, rich)
+        # Attach any pending comments to their corresponding w:p elements
+        para_els = [p for p in rich if p.tag == qn("w:p")]
+        for src_para, para_el in zip(
+                [p for p in rich_paras if p.plain_text().strip()], para_els):
+            if src_para.comment:
+                _p_attach_comment(doc, para_el, src_para.comment)
 
     # Pass 2b: overflow insertions
     overflow_ops = [op for op in ops if op.kind == "insert_overflow_task"]
@@ -1111,6 +1606,11 @@ def p_execute_operations(doc, ops, warnings):
             continue
         _p_replace_placeholder_in_xml(new_h2_xml, "[task title]", task["title"])
         rich = build_rich(task["paras"]); insert_after(new_h2_xml, rich)
+        para_els = [p for p in rich if p.tag == qn("w:p")]
+        for src_para, para_el in zip(
+                [p for p in task["paras"] if p.plain_text().strip()], para_els):
+            if src_para.comment:
+                _p_attach_comment(doc, para_el, src_para.comment)
 
     # Pass 3: deletions
     for op in ops:
@@ -1125,10 +1625,26 @@ def p_execute_operations(doc, ops, warnings):
 
 
 def p_populate_word_template(markdown_file, template_file, output_file,
-                             api_key=None, fetch_meta=False):
+                             api_key=None, fetch_meta=False,
+                             strip_brackets=False, include_attachments=True,
+                             import_course_name=False, validate_links=False):
     """Top-level entry point: convert and save. Returns list of warning strings."""
-    parsed, warnings = p_parse_markdown(markdown_file, api_key=api_key, fetch_meta=fetch_meta)
+    parsed, warnings = p_parse_markdown(
+        markdown_file, api_key=api_key, fetch_meta=fetch_meta,
+        strip_brackets=strip_brackets, include_attachments=include_attachments,
+        import_course_name=import_course_name, validate_links=validate_links)
     doc   = Document(template_file)
+    # Apply course name to the Title-style paragraph if detected
+    if parsed.get("course_name"):
+        for p in doc.paragraphs:
+            if p.style.name == "Title":
+                for run in p.runs:
+                    run.text = ""
+                if p.runs:
+                    p.runs[0].text = parsed["course_name"]
+                else:
+                    p.text = parsed["course_name"]
+                break
     paras = list(doc.paragraphs)
     ops = p_plan_operations(parsed, paras, warnings)
     p_execute_operations(doc, ops, warnings)
@@ -1137,7 +1653,7 @@ def p_populate_word_template(markdown_file, template_file, output_file,
 
 
 # ═══════════════════════════════════════════════════════════════
-#  WORD → BRIGHTSPACE  CONVERSION LOGIC  (unchanged from converter.py)
+#  WORD to BRIGHTSPACE  CONVERSION LOGIC  (unchanged from converter.py)
 # ═══════════════════════════════════════════════════════════════
 
 CONFIG_FILE   = Path.home() / ".brightspace_converter_config.json"
@@ -1294,7 +1810,7 @@ def _collect_images(para, image_collector):
     return rId_to_info
 
 
-def _extract_runs(el, hyperlink_map, image_collector=None, rId_to_fname=None):
+def _extract_runs(el, hyperlink_map, image_collector=None, rId_to_fname=None, video_set=None):
     parts = []
     for child in el:
         tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
@@ -1313,15 +1829,25 @@ def _extract_runs(el, hyperlink_map, image_collector=None, rId_to_fname=None):
                         safe_src = escape_html(fname); safe_alt = escape_html(alt_text) if alt_text else safe_src
                         parts.append(f'<img src="images/{safe_src}" alt="{safe_alt}" style="max-width:100%;">')
         elif tag == "hyperlink":
-            rid = child.get(qn("r:id")); url = hyperlink_map.get(rid,"#")
-            inner = _extract_runs(child, hyperlink_map, image_collector, rId_to_fname)
-            if inner: parts.append(f'<a href="{escape_html(url)}">{inner}</a>')
-        elif tag in ("ins","del","smartTag","sdt","sdtContent"):
-            parts.append(_extract_runs(child, hyperlink_map, image_collector, rId_to_fname))
+            rid = child.get(qn("r:id")); url = hyperlink_map.get(rid, "#")
+            yt_m = _YT_RE.search(url) if url else None
+            if yt_m:
+                vid_id = yt_m.group(1)
+                if video_set is not None:
+                    video_set.add(vid_id)
+                # Emit a sentinel; para_to_inline_html hoists the iframe after </p>
+                parts.append(f"[[YT:{vid_id}]]")
+            else:
+                inner = _extract_runs(child, hyperlink_map, image_collector, rId_to_fname, video_set)
+                if inner: parts.append(f'<a href="{escape_html(url)}">{inner}</a>')
+        elif tag in ("ins", "del", "smartTag", "sdt", "sdtContent"):
+            parts.append(_extract_runs(child, hyperlink_map, image_collector, rId_to_fname, video_set))
     return "".join(parts)
 
 
-def para_to_inline_html(para, image_collector=None):
+def para_to_inline_html(para, image_collector=None, video_set=None):
+    """Return (inline_html, after_html) where after_html holds any iframe blocks
+    that must be placed *after* the closing </p> tag for this paragraph."""
     hyperlink_map = {}
     try:
         for rel in para.part.rels.values():
@@ -1329,7 +1855,11 @@ def para_to_inline_html(para, image_collector=None):
     except Exception: pass
     rId_to_fname = None
     if image_collector is not None: rId_to_fname = _collect_images(para, image_collector)
-    return _extract_runs(para._p, hyperlink_map, image_collector, rId_to_fname)
+    raw = _extract_runs(para._p, hyperlink_map, image_collector, rId_to_fname, video_set)
+    iframes = [_make_video_iframe(m.group(1)) for m in _YT_SENTINEL_RE.finditer(raw)]
+    inline = _YT_SENTINEL_RE.sub("", raw).strip()
+    after  = "\n".join(iframes)
+    return inline, after
 
 
 def _w_attr(el, local_name):
@@ -1365,56 +1895,61 @@ def run_to_html(r):
     return text
 
 
-def render_list(list_paras, force_tag=None, image_collector=None):
+def render_list(list_paras, force_tag=None, image_collector=None, video_set=None):
     lines = []; stack = []
     for para in list_paras:
         level = list_indent_level(para)
         tag   = force_tag if force_tag else ("ol" if is_ordered_para(para) else "ul")
-        inline = para_to_inline_html(para, image_collector)
+        inline, after = para_to_inline_html(para, image_collector, video_set)
         while len(stack) <= level:
             lines.append("  " * len(stack) + f"<{tag}>"); stack.append((len(stack),tag))
         while len(stack) > level + 1:
             _, ct = stack.pop(); lines.append("  " * len(stack) + f"</{ct}>")
         lines.append("  " * (level+1) + f"<li>{inline}</li>")
+        if after: lines.append(after)
     while stack:
         _, ct = stack.pop(); lines.append("  " * len(stack) + f"</{ct}>")
     return "\n".join(lines)
 
 
-def _render_accordion_body(paragraphs, image_collector=None):
+def _render_accordion_body(paragraphs, image_collector=None, video_set=None):
     html_parts = []; paras = list(paragraphs); i = 0
     while i < len(paras):
         para = paras[i]; sn = style_name(para)
         if sn in BLOCKQUOTE_STYLES:
             collected = []
             while i < len(paras) and style_name(paras[i]) in BLOCKQUOTE_STYLES:
-                collected.append(para_to_inline_html(paras[i], image_collector)); i += 1
+                collected.append(para_to_inline_html(paras[i], image_collector, video_set)); i += 1
             html_parts.append("<blockquote>")
-            for line in collected: html_parts.append(f"  <p>{line}</p>")
+            for inline, after in collected:
+                html_parts.append(f"  <p>{inline}</p>")
+                if after: html_parts.append(after)
             html_parts.append("</blockquote>"); continue
         if is_list_para(para):
             list_paras = []
             while i < len(paras) and is_list_para(paras[i]):
                 list_paras.append(paras[i]); i += 1
-            html_parts.append(render_list(list_paras, image_collector=image_collector)); continue
-        inline = para_to_inline_html(para, image_collector)
+            html_parts.append(render_list(list_paras, image_collector=image_collector, video_set=video_set)); continue
+        inline, after = para_to_inline_html(para, image_collector, video_set)
         if not inline.strip(): i += 1; continue
-        html_parts.append(f"<p>{inline}</p>"); i += 1
+        html_parts.append(f"<p>{inline}</p>")
+        if after: html_parts.append(after)
+        i += 1
     return html_parts
 
 
-def render_accordion(cell_paragraphs, acc_heading, image_collector=None):
+def render_accordion(cell_paragraphs, acc_heading, image_collector=None, video_set=None):
     cards = []; cur_title = None; cur_body = []
     for para in cell_paragraphs:
         if style_name(para) == acc_heading:
             if cur_title is not None: cards.append((cur_title, list(cur_body)))
-            cur_title = para_to_inline_html(para, image_collector); cur_body = []
+            cur_title, _acc_after = para_to_inline_html(para, image_collector, video_set); cur_body = []
         else:
             cur_body.append(para)
     if cur_title is not None: cards.append((cur_title, list(cur_body)))
     lines = ['<div class="accordion">']
     for title, body_paras in cards:
-        body_lines = _render_accordion_body(body_paras, image_collector)
+        body_lines = _render_accordion_body(body_paras, image_collector, video_set)
         lines += ['  <div class="card">','    <div class="card-header">',
                   f'      <h2 class="card-title">{title}</h2>','    </div>',
                   '    <div class="collapse">','      <div class="card-body">']
@@ -1439,7 +1974,7 @@ def render_table(table):
             cid = id(cell)
             if cid in seen: continue
             seen.add(cid); tag = "th" if i == 0 else "td"
-            content = " ".join(para_to_inline_html(p) for p in cell.paragraphs).strip()
+            content = " ".join(para_to_inline_html(p)[0] for p in cell.paragraphs).strip()
             lines.append(f"    <{tag}>{content}</{tag}>")
         lines.append("  </tr>")
     lines.append("</table>"); return "\n".join(lines)
@@ -1549,7 +2084,7 @@ def convert_docx(docx_path, settings):
         doc = Document(docx_path)
     _accept_tracked_changes(doc)
 
-    image_collector = {}; html_parts = []
+    image_collector = {}; html_parts = []; video_set = set()
     n_headings=0; n_paras=0; n_lists=0; n_blockquotes=0; n_tables=0; n_accordions=0; n_skipped=0
     unknown_styles = {}
 
@@ -1569,7 +2104,7 @@ def convert_docx(docx_path, settings):
         if kind == "table":
             if is_accordion_table(obj, acc_head):
                 cells = list({id(c):c for row in obj.rows for c in row.cells}.values())
-                html_parts.append(render_accordion(cells[0].paragraphs, acc_head, image_collector=image_collector))
+                html_parts.append(render_accordion(cells[0].paragraphs, acc_head, image_collector=image_collector, video_set=video_set))
                 n_accordions += 1
             else:
                 html_parts.append(render_table(obj)); n_tables += 1
@@ -1579,8 +2114,9 @@ def convert_docx(docx_path, settings):
         if sn in hmap:
             out_tag = hmap[sn]
             if out_tag != "(skip)":
-                inline = para_to_inline_html(para, image_collector)
+                inline, after = para_to_inline_html(para, image_collector, video_set)
                 html_parts.append(f"<p>{inline}</p>" if out_tag=="p" else f"<{out_tag}>{inline}</{out_tag}>")
+                if after: html_parts.append(after)
                 n_headings += 1
             else: n_skipped += 1
             i += 1; continue
@@ -1589,10 +2125,12 @@ def convert_docx(docx_path, settings):
             if bq_out == "(skip)": n_skipped += 1; i += 1; continue
             open_tag,close_tag = _bq_tags(bq_out); collected = []
             while (i<len(blocks) and blocks[i][0]=="para" and style_name(blocks[i][1]) in BLOCKQUOTE_STYLES):
-                collected.append(para_to_inline_html(blocks[i][1], image_collector)); i += 1
+                collected.append(para_to_inline_html(blocks[i][1], image_collector, video_set)); i += 1
             html_parts.append(open_tag)
             if bq_hr and bq_out=="blockquote": html_parts.append("  <hr>")
-            for line in collected: html_parts.append(f"  <p>{line}</p>")
+            for inline, after in collected:
+                html_parts.append(f"  <p>{inline}</p>")
+                if after: html_parts.append(after)
             if bq_hr and bq_out=="blockquote": html_parts.append("  <hr>")
             html_parts.append(close_tag); n_blockquotes += len(collected); continue
 
@@ -1603,14 +2141,16 @@ def convert_docx(docx_path, settings):
             all_ord = all(is_ordered_para(p) for p in list_paras)
             all_bul = all(not is_ordered_para(p) for p in list_paras)
             force   = ol_out if all_ord else (ul_out if all_bul else None)
-            html_parts.append(render_list(list_paras,force_tag=force,image_collector=image_collector))
+            html_parts.append(render_list(list_paras, force_tag=force, image_collector=image_collector, video_set=video_set))
             n_lists += len(list_paras); continue
 
-        inline = para_to_inline_html(para, image_collector)
+        inline, after = para_to_inline_html(para, image_collector, video_set)
         if not inline.strip(): i += 1; continue
         if sn and sn not in ("Normal","Body Text","Default Paragraph Font","No Spacing",""):
             unknown_styles[sn] = unknown_styles.get(sn,0)+1
-        html_parts.append(f"<p>{inline}</p>"); n_paras += 1; i += 1
+        html_parts.append(f"<p>{inline}</p>")
+        if after: html_parts.append(after)
+        n_paras += 1; i += 1
 
     parts_summary = []
     if n_headings:    parts_summary.append(f"{n_headings} heading{'s' if n_headings!=1 else ''}")
@@ -1624,12 +2164,16 @@ def convert_docx(docx_path, settings):
         _log("info",f"{len(image_collector)} image{'s' if len(image_collector)!=1 else ''} extracted: "+", ".join(image_collector.keys()))
     else:
         _log("info","No images found in document")
+    if video_set:
+        _log("info",f"{len(video_set)} video embed{'s' if len(video_set)!=1 else ''} converted to responsive iframe{'s' if len(video_set)!=1 else ''}")
     if n_skipped: _log("warn",f"{n_skipped} element{'s' if n_skipped!=1 else ''} skipped (heading or blockquote set to '(skip)' in Settings)")
     for sn,count in sorted(unknown_styles.items(),key=lambda x:-x[1]):
         _log("warn",f"Unrecognised style '{sn}' ({count}×) — converted as plain <p>")
 
     body = "\n".join(html_parts)
     if strip_style: body = re.sub(r' *style="[^"]*"',"",body)
+    if video_set:
+        body = VIDEO_WRAP_CSS + "\n" + body
     link_annotations = _collect_image_link_annotations(doc)
     return body, image_collector, log, link_annotations
 
@@ -1728,6 +2272,8 @@ img{max-width:100%;height:auto;display:block;margin:.5em 0} hr{border:none;borde
 .card-title{margin:0;font-size:1em;font-weight:700;color:#006fbf}
 .card-body{padding:14px 18px;background:#ffffff} .card-body p:last-child{margin-bottom:0}
 div.callout{background:#fff8e1;border-left:4px solid #f9a825;padding:10px 16px;margin:1em 0;border-radius:0 3px 3px 0;color:#424242}
+.video-wrap{position:relative;padding-bottom:56.25%;height:0;overflow:hidden;margin:1em 0}
+.video-wrap iframe{position:absolute;top:0;left:0;width:100%;height:100%;border:0}
 """
 
 
@@ -1764,8 +2310,12 @@ class ConverterApp(tk.Tk):
         self._source_wrap    = tk.BooleanVar(value=False)
         self._last_file_dir  = None
 
-        self._p_preview_mode = tk.StringVar(value="rendered")  # Padlet tab preview mode
-        self._youtube_api_key = ""
+        self._p_preview_mode       = tk.StringVar(value="rendered")  # Padlet tab preview mode
+        self._youtube_api_key      = ""
+        self._p_strip_brackets     = tk.BooleanVar(value=False)
+        self._p_include_attach     = tk.BooleanVar(value=True)
+        self._p_import_course_name = tk.BooleanVar(value=False)
+        self._p_validate_links     = tk.BooleanVar(value=False)
         self._p_last_md_path    = None
         self._p_last_docx_path  = None
 
@@ -1865,27 +2415,27 @@ class ConverterApp(tk.Tk):
 
         def _on_tab_change(event=None):
             idx = self.nb.index(self.nb.select())
-            if idx == 2:   # Settings — collapse right pane to 0 width
+            if idx == 2:   # Settings — collapse right pane instantly
                 self._word_preview_frame.pack_forget()
                 self._padlet_preview_frame.pack_forget()
                 pane.paneconfigure(self._right_pane, minsize=0, width=0)
-                # Move sash all the way right so nb_frame fills the window
-                self.after(1, lambda: pane.sash_place(0, 99999, 0))
+                pane.update_idletasks()
+                pane.sash_place(0, pane.winfo_width(), 0)
             else:
-                pane.paneconfigure(self._right_pane, minsize=380)
-                # Restore sash to a sensible split position
-                self.after(1, lambda: pane.sash_place(0, 420, 0))
                 if idx == 1:   # Padlet -> Word tab
                     self._word_preview_frame.pack_forget()
                     self._padlet_preview_frame.pack(fill="both", expand=True)
                 else:          # Word to Brightspace tab
                     self._padlet_preview_frame.pack_forget()
                     self._word_preview_frame.pack(fill="both", expand=True)
+                pane.paneconfigure(self._right_pane, minsize=380)
+                pane.update_idletasks()
+                pane.sash_place(0, 420, 0)
 
         self.nb.bind("<<NotebookTabChanged>>", _on_tab_change)
 
     # ════════════════════════════════════════════════════════
-    #  PADLET → WORD  TAB
+    #  PADLET to WORD  TAB
     # ════════════════════════════════════════════════════════
 
     def _build_padlet_tab(self, p):
@@ -1965,7 +2515,7 @@ class ConverterApp(tk.Tk):
         # ── Generate button ───────────────────────────────────
         tk.Frame(p, bg=BORDER, height=1).pack(fill="x", pady=(10,0))
         self._p_btn = tk.Button(
-            p, text="Generate  →", font=FONT_B,
+            p, text="Generate  to", font=FONT_B,
             bg=ACCENT, fg=FG, relief="flat", bd=0,
             padx=16, pady=10, cursor="hand2",
             activebackground=ACCENT2, activeforeground=FG,
@@ -2054,7 +2604,11 @@ class ConverterApp(tk.Tk):
                 warns = p_populate_word_template(
                     md, tmpl, out,
                     api_key=self._youtube_api_key or None,
-                    fetch_meta=bool(self._youtube_api_key))
+                    fetch_meta=bool(self._youtube_api_key),
+                    strip_brackets=self._p_strip_brackets.get(),
+                    include_attachments=self._p_include_attach.get(),
+                    import_course_name=self._p_import_course_name.get(),
+                    validate_links=self._p_validate_links.get())
                 self.after(0, self._p_on_success, out, warns)
             except Exception:
                 import traceback
@@ -2071,13 +2625,13 @@ class ConverterApp(tk.Tk):
         else:
             self._p_status_var.set(f"✓  Saved — {short}")
             self._p_status_lbl.config(fg=SUCCESS)
-        self._p_btn.configure(state="normal", text="Generate  →")
+        self._p_btn.configure(state="normal", text="Generate  to")
         self._p_refresh_preview(out_path)
 
     def _p_on_error(self, tb):
         first = [l.strip() for l in tb.splitlines() if l.strip()][-1]
         self._p_status_var.set(f"✗  {first}"); self._p_status_lbl.config(fg=ERR)
-        self._p_btn.configure(state="normal", text="Generate  →")
+        self._p_btn.configure(state="normal", text="Generate  to")
         # Show full traceback in an expandable detail window
         win = tk.Toplevel(self); win.title("Error details")
         win.geometry("660x320"); win.configure(fg_color=BG) if hasattr(win,"fg_color") else win.configure(bg=BG)
@@ -2089,7 +2643,7 @@ class ConverterApp(tk.Tk):
         box.insert("end", tb); box.configure(state="disabled")
 
     def _build_padlet_preview(self, parent):
-        """Right-side preview panel for the Padlet → Word tab."""
+        """Right-side preview panel for the Padlet to Word tab."""
         # ── Toolbar ──────────────────────────────────────────
         bar = tk.Frame(parent, bg=BG2); bar.pack(fill="x")
         tk.Frame(bar, bg=BORDER, height=1).pack(side="bottom", fill="x")
@@ -2107,6 +2661,24 @@ class ConverterApp(tk.Tk):
         _mode_btn("Side by Side", "split")
         _mode_btn("MD Source", "md_source")
         _mode_btn("Rendered", "rendered")
+        self._p_source_wrap = tk.BooleanVar(value=False)
+        def _p_toggle_wrap():
+            wrap_val = "word" if self._p_source_wrap.get() else "none"
+            self._p_source_text.config(wrap=wrap_val)
+            self._p_split_source_text.config(wrap=wrap_val)
+            if self._p_source_wrap.get():
+                self._p_src_hsb.pack_forget()
+                self._p_split_src_hsb.pack_forget()
+            else:
+                self._p_src_hsb.pack(side="bottom", fill="x")
+                self._p_split_src_hsb.pack(side="bottom", fill="x")
+        tk.Checkbutton(bar, text=" ⇄ Wrap  ", variable=self._p_source_wrap,
+                       font=FONT, bg=BG2, fg=FG3,
+                       activebackground=BG2, activeforeground=FG,
+                       selectcolor=BG3, indicatoron=False,
+                       relief="flat", bd=0, padx=8, pady=5, cursor="hand2",
+                       command=_p_toggle_wrap).pack(side="left", padx=(2, 0), pady=4)
+
 
         # ── Preview area ──────────────────────────────────────
         self._p_preview_outer = tk.Frame(parent, bg=PRE_BG)
@@ -2126,9 +2698,9 @@ class ConverterApp(tk.Tk):
             padx=12, pady=12, selectbackground=ACCENT, selectforeground=FG,
             state="disabled")
         _vsb = ttk.Scrollbar(self._p_source_frame, orient="vertical", command=self._p_source_text.yview)
-        _hsb = ttk.Scrollbar(self._p_source_frame, orient="horizontal", command=self._p_source_text.xview)
-        self._p_source_text.configure(yscrollcommand=_vsb.set, xscrollcommand=_hsb.set)
-        _vsb.pack(side="right", fill="y"); _hsb.pack(side="bottom", fill="x")
+        self._p_src_hsb = ttk.Scrollbar(self._p_source_frame, orient="horizontal", command=self._p_source_text.xview)
+        self._p_source_text.configure(yscrollcommand=_vsb.set, xscrollcommand=self._p_src_hsb.set)
+        _vsb.pack(side="right", fill="y"); self._p_src_hsb.pack(side="bottom", fill="x")
         self._p_source_text.pack(fill="both", expand=True)
 
         # Rendered (Word-like) view
@@ -2159,9 +2731,9 @@ class ConverterApp(tk.Tk):
             padx=12, pady=12, selectbackground=ACCENT, selectforeground=FG,
             state="disabled")
         _sp_vsb = ttk.Scrollbar(_sp_left, orient="vertical", command=self._p_split_source_text.yview)
-        _sp_hsb = ttk.Scrollbar(_sp_left, orient="horizontal", command=self._p_split_source_text.xview)
-        self._p_split_source_text.configure(yscrollcommand=_sp_vsb.set, xscrollcommand=_sp_hsb.set)
-        _sp_vsb.pack(side="right", fill="y"); _sp_hsb.pack(side="bottom", fill="x")
+        self._p_split_src_hsb = ttk.Scrollbar(_sp_left, orient="horizontal", command=self._p_split_source_text.xview)
+        self._p_split_source_text.configure(yscrollcommand=_sp_vsb.set, xscrollcommand=self._p_split_src_hsb.set)
+        _sp_vsb.pack(side="right", fill="y"); self._p_split_src_hsb.pack(side="bottom", fill="x")
         self._p_split_source_text.pack(fill="both", expand=True)
 
         _sp_right = tk.Frame(self._p_split_pane, bg=D2L_SHELL)
@@ -2286,7 +2858,7 @@ class ConverterApp(tk.Tk):
                 # ── counters for auto-numbered headings (Fix 1) ──────────
                 _mod_counter  = 0
                 _task_counter = 0  # resets per module
-                _is_first_para = True   # Fix 2: first non-empty para → h1
+                _is_first_para = True   # Fix 2: first non-empty para to h1
 
                 # ── list-state tracking (Fix 4) ──────────────────────────
                 _in_list      = False   # are we currently inside a <ul>/<ol>?
@@ -2345,7 +2917,22 @@ class ConverterApp(tk.Tk):
 
                     return "".join(_runs(para._p))
 
-                for para in doc.paragraphs:
+                # ── Pre-scan: identify which H1 paragraphs are real module
+                # headings (followed within 6 paras by the module-objectives
+                # sentinel) so that pre-module H1s (e.g. "Course Learning
+                # Objectives", "Evidence of Learning") are rendered without a
+                # "Module N:" prefix in the preview. File output is unaffected.
+                _all_paras  = list(doc.paragraphs)
+                _module_h1s = set()
+                for _pi, _pp in enumerate(_all_paras):
+                    if not (_pp.style.name if _pp.style else "").startswith("Heading 1"):
+                        continue
+                    for _look in _all_paras[_pi + 1: _pi + 7]:
+                        if "in this module you will have the opportunity" in _look.text.lower():
+                            _module_h1s.add(_pi)
+                            break
+
+                for _para_idx, para in enumerate(_all_paras):
                     sn   = para.style.name if para.style else ""
                     text = para.text.strip()
 
@@ -2372,7 +2959,7 @@ class ConverterApp(tk.Tk):
 
                     inline = _para_inline(para)
 
-                    # ── Fix 2: very first non-empty paragraph → h1 ───────
+                    # ── Fix 2: very first non-empty paragraph to h1 ───────
                     if _is_first_para:
                         _is_first_para = False
                         # Treat as Heading 1 regardless of Word style
@@ -2380,14 +2967,14 @@ class ConverterApp(tk.Tk):
 
                     # ── headings with auto-numbering (Fixes 1 & 2) ───────
                     if sn.startswith("Heading 1"):
-                        # Heading 1 = Module title — inject "Module N: " prefix
-                        _mod_counter += 1
                         _task_counter = 0
-                        # If the text already carries a "Module N:" prefix
-                        # (written literally into the docx), use it as-is;
-                        # otherwise synthesise one.
-                        if not re.match(r"Module\s+\d+\s*:", text, re.IGNORECASE):
-                            inline = f"Module {_mod_counter}: {inline}"
+                        # Only inject "Module N:" for real module headings.
+                        # Pre-module H1s (e.g. "Course Learning Objectives",
+                        # "Evidence of Learning") render without a module number.
+                        if _para_idx in _module_h1s:
+                            _mod_counter += 1
+                            if not re.match(r"Module\s+\d+\s*:", text, re.IGNORECASE):
+                                inline = f"Module {_mod_counter}: {inline}"
                         html_parts.append(f"<h1>{inline}</h1>")
 
                     elif sn.startswith("Heading 2"):
@@ -2433,7 +3020,7 @@ class ConverterApp(tk.Tk):
         self._p_preview_status.config(text=f"Preview: {fname}", fg=FG2)
 
     # ════════════════════════════════════════════════════════
-    #  CONVERT TAB  (Word → Brightspace, unchanged)
+    #  CONVERT TAB  (Word to Brightspace, unchanged)
     # ════════════════════════════════════════════════════════
 
     def _build_convert_tab(self, p):
@@ -2552,7 +3139,7 @@ class ConverterApp(tk.Tk):
         self._log_text.tag_configure("dim",   foreground=FG3)
 
         tk.Frame(p, bg=BORDER, height=1).pack(fill="x", pady=(10,0))
-        btn_convert = tk.Button(p, text="Convert  →", font=FONT_B,
+        btn_convert = tk.Button(p, text="Convert  to", font=FONT_B,
                                 bg=ACCENT, fg=FG, relief="flat", bd=0,
                                 padx=16, pady=10, cursor="hand2",
                                 activebackground=ACCENT2, activeforeground=FG,
@@ -2607,7 +3194,7 @@ class ConverterApp(tk.Tk):
                                            variable=self._batch_progress_var, maximum=100, length=300)
         self._batch_bar.pack(fill="x", pady=(2,0))
 
-        self._batch_btn = tk.Button(p, text="Convert All  →", font=FONT_B,
+        self._batch_btn = tk.Button(p, text="Convert All  to", font=FONT_B,
                                     bg=ACCENT, fg=FG, relief="flat", bd=0,
                                     padx=16, pady=10, cursor="hand2",
                                     activebackground=ACCENT2, activeforeground=FG,
@@ -2673,7 +3260,7 @@ class ConverterApp(tk.Tk):
         def _convert_one(idx):
             if idx >= total:
                 self._batch_running = False
-                self._batch_btn.config(state="normal", text="Convert All  →")
+                self._batch_btn.config(state="normal", text="Convert All  to")
                 self._batch_progress_lbl_var.set(f"Done — {total} file{'s' if total!=1 else ''} converted")
                 return
             entry = checked[idx]
@@ -2788,7 +3375,7 @@ class ConverterApp(tk.Tk):
         # ── Brightspace section header ────────────────────────
         bs_hdr = tk.Frame(inner, bg=BG3, highlightthickness=1, highlightbackground=BORDER)
         bs_hdr.pack(fill="x", pady=(0, 10))
-        tk.Label(bs_hdr, text="  Word → Brightspace", font=("Segoe UI", 11, "bold"),
+        tk.Label(bs_hdr, text="  Word to Brightspace", font=("Segoe UI", 11, "bold"),
                  bg=BG3, fg=ACCENT2, padx=4, pady=8).pack(side="left")
 
         self._sep(inner,"Presets","Save current settings as a named preset.")
@@ -2821,7 +3408,7 @@ class ConverterApp(tk.Tk):
         defaults    = list(DEFAULT_HEADING_MAP.values())
         for idx,(ws,dfl) in enumerate(zip(word_styles,defaults)):
             tk.Label(hf, text=ws, font=FONT, bg=BG2, fg=FG).grid(row=idx+1,column=0,sticky="w",pady=3,padx=(0,6))
-            tk.Label(hf, text="→", font=FONT, bg=BG2, fg=FG3).grid(row=idx+1,column=1,padx=8)
+            tk.Label(hf, text="to", font=FONT, bg=BG2, fg=FG3).grid(row=idx+1,column=1,padx=8)
             var = tk.StringVar(value=dfl); self.heading_vars[ws] = var
             cb = ttk.Combobox(hf, textvariable=var, values=HEADING_OPTS, state="readonly", width=10)
             cb.grid(row=idx+1,column=2,sticky="w",pady=3)
@@ -2829,8 +3416,8 @@ class ConverterApp(tk.Tk):
 
         self._sep(inner,"List Transform","Choose HTML list element for bullet/numbered lists.")
         lf = tk.Frame(inner, bg=BG2); lf.pack(fill="x", pady=(0,8))
-        list_rows = [("Bullet list (UL) →",self.ul_var,"Force bullet lists to ul or ol."),
-                     ("Numbered list (OL) →",self.ol_var,"Force numbered lists to ol or ul.")]
+        list_rows = [("Bullet list (UL) to",self.ul_var,"Force bullet lists to ul or ol."),
+                     ("Numbered list (OL) to",self.ol_var,"Force numbered lists to ol or ul.")]
         for row_i,(lbl,var,tip_text) in enumerate(list_rows):
             tk.Label(lf, text=lbl, font=FONT, bg=BG2, fg=FG).grid(row=row_i,column=0,sticky="w",pady=3,padx=(0,8))
             cb = ttk.Combobox(lf, textvariable=var, values=LIST_OPTS, state="readonly", width=10)
@@ -2839,7 +3426,7 @@ class ConverterApp(tk.Tk):
 
         self._sep(inner,"Blockquote Transform","Control how Word 'Quote' styles are output.")
         bqf = tk.Frame(inner, bg=BG2); bqf.pack(fill="x", pady=(0,8))
-        tk.Label(bqf, text="Quote style →", font=FONT, bg=BG2, fg=FG).grid(row=0,column=0,sticky="w",padx=(0,8),pady=2)
+        tk.Label(bqf, text="Quote style to", font=FONT, bg=BG2, fg=FG).grid(row=0,column=0,sticky="w",padx=(0,8),pady=2)
         cb_bq = ttk.Combobox(bqf, textvariable=self.bq_var, values=BQ_OPTS, state="readonly", width=22)
         cb_bq.grid(row=0,column=1,sticky="w"); cb_bq.bind("<<ComboboxSelected>>", lambda e: self._refresh_preview())
         cb_hr = tk.Checkbutton(bqf, text="Add <hr> dividers inside blockquote",
@@ -2849,9 +3436,9 @@ class ConverterApp(tk.Tk):
                                command=self._refresh_preview)
         cb_hr.grid(row=1,column=0,columnspan=2,sticky="w",pady=(4,0))
 
-        self._sep(inner,"Accordion Card Title Style","Single-cell tables → D2L accordions.")
+        self._sep(inner,"Accordion Card Title Style","Single-cell tables to D2L accordions.")
         af = tk.Frame(inner, bg=BG2); af.pack(fill="x", pady=(0,8))
-        tk.Label(af, text="Trigger heading →", font=FONT, bg=BG2, fg=FG).grid(row=0,column=0,sticky="w",padx=(0,8))
+        tk.Label(af, text="Trigger heading to", font=FONT, bg=BG2, fg=FG).grid(row=0,column=0,sticky="w",padx=(0,8))
         cb_acc = ttk.Combobox(af, textvariable=self.acc_head_var,
                               values=[f"Heading {n}" for n in range(1,7)],
                               state="readonly", width=12)
@@ -2874,7 +3461,7 @@ class ConverterApp(tk.Tk):
 
         self._sep(inner,"Paragraph Font Size","Font size for body paragraphs in preview.")
         pff = tk.Frame(inner, bg=BG2); pff.pack(fill="x", pady=(0,8))
-        tk.Label(pff, text="Body text size →", font=FONT, bg=BG2, fg=FG).grid(row=0,column=0,sticky="w",padx=(0,8))
+        tk.Label(pff, text="Body text size to", font=FONT, bg=BG2, fg=FG).grid(row=0,column=0,sticky="w",padx=(0,8))
         pf_spin = tk.Spinbox(pff, from_=10, to=36, increment=1, textvariable=self.para_font_size,
                              width=5, font=FONT, bg=BG3, fg=FG, insertbackground=FG,
                              buttonbackground=BG3, relief="flat", command=self._on_font_size_change)
@@ -2899,11 +3486,10 @@ class ConverterApp(tk.Tk):
         rpi_cb = tk.Checkbutton(
             rpi_frame,
             text="Remove bracketed content on import",
-            variable=tk.BooleanVar(value=False),
-            state="disabled",
-            bg=BG2, fg=FG3,
+            variable=self._p_strip_brackets,
+            bg=BG2, fg=FG,
             activebackground=BG2, activeforeground=FG,
-            selectcolor=BG3, disabledforeground=FG3,
+            selectcolor=BG3,
             font=FONT, bd=0, highlightthickness=0)
         rpi_cb.pack(anchor="w")
         tip(rpi_cb,
@@ -2920,11 +3506,10 @@ class ConverterApp(tk.Tk):
         laf_cb = tk.Checkbutton(
             laf_frame,
             text="Link to attached files",
-            variable=tk.BooleanVar(value=True),
-            state="disabled",
-            bg=BG2, fg=FG3,
+            variable=self._p_include_attach,
+            bg=BG2, fg=FG,
             activebackground=BG2, activeforeground=FG,
-            selectcolor=BG3, disabledforeground=FG3,
+            selectcolor=BG3,
             font=FONT, bd=0, highlightthickness=0)
         laf_cb.pack(anchor="w")
         tip(laf_cb,
@@ -2940,11 +3525,10 @@ class ConverterApp(tk.Tk):
         icn_cb = tk.Checkbutton(
             icn_frame,
             text="Detect and reformat course name",
-            variable=tk.BooleanVar(value=False),
-            state="disabled",
-            bg=BG2, fg=FG3,
+            variable=self._p_import_course_name,
+            bg=BG2, fg=FG,
             activebackground=BG2, activeforeground=FG,
-            selectcolor=BG3, disabledforeground=FG3,
+            selectcolor=BG3,
             font=FONT, bd=0, highlightthickness=0)
         icn_cb.pack(anchor="w")
         tip(icn_cb,
@@ -2954,6 +3538,31 @@ class ConverterApp(tk.Tk):
             "Format: \u201cCONT806: The Learning Environment\u201d \u2014 the course code is "
             "extracted and moved to the front, followed by the descriptive title. "
             "Replaces the current placeholder \u201cCONT###:\u201d heading in the template.")
+
+        # ── Validate Links ───────────────────────────
+        self._sep(inner, "Validate Links",
+                  "Check each resource link and add a Word comment if it is broken, "
+                  "redirected, restricted, or contains tracking parameters.")
+        vl_frame = tk.Frame(inner, bg=BG2); vl_frame.pack(fill="x", pady=(0, 8))
+        vl_cb = tk.Checkbutton(
+            vl_frame,
+            text="Validate links on conversion",
+            variable=self._p_validate_links,
+            bg=BG2, fg=FG,
+            activebackground=BG2, activeforeground=FG,
+            selectcolor=BG3,
+            font=FONT, bd=0, highlightthickness=0)
+        vl_cb.pack(anchor="w")
+        tip(vl_cb,
+            "Makes an HTTP request for each link during conversion and attaches a "
+            "Word comment to any that are flagged.\n\n"
+            "• Broken link — add correct URL before publishing\n"
+            "• Redirected — update to final destination URL\n"
+            "• Access restricted (403) — verify manually in browser\n"
+            "• Could not verify — check manually\n"
+            "• Tracking parameters — consider stripping utm_source etc.\n\n"
+            "Will add time to conversion (one request per link). "
+            "Requires an internet connection.")
 
         # ── Resource Metadata / YouTube API Key ───────────
         self._sep(inner, "Resource Metadata",
@@ -3153,7 +3762,7 @@ class ConverterApp(tk.Tk):
         if last and last in self.presets: self._refresh_preset_combo(select=last)
         else: self._refresh_preset_combo()
 
-    # ── Conversion log (Word → Brightspace) ──────────────────
+    # ── Conversion log (Word to Brightspace) ──────────────────
 
     def _toggle_log(self):
         if self._log_expanded.get():
@@ -3885,7 +4494,7 @@ class ConverterApp(tk.Tk):
 
             def _img_note(n):
                 if n==0: return ""
-                return f"  ({n} image{'s' if n!=1 else ''} → images/)"
+                return f"  ({n} image{'s' if n!=1 else ''} to images/)"
 
             if self.split_modules_var.get(): modules=split_modules(body_html)
             else: modules=[]
@@ -3950,7 +4559,11 @@ class ConverterApp(tk.Tk):
                "split_modules":self.split_modules_var.get(),"strip_style":self.strip_style_var.get(),
                "para_font_size":self.para_font_size.get(),"css_path":self.custom_css_path or "",
                "last_preset":self.preset_var.get(),"last_file_dir":self._last_file_dir or "",
-               "youtube_api_key":self._youtube_api_key}
+               "youtube_api_key":self._youtube_api_key,
+               "p_strip_brackets":self._p_strip_brackets.get(),
+               "p_include_attach":self._p_include_attach.get(),
+               "p_import_course_name":self._p_import_course_name.get(),
+               "p_validate_links":self._p_validate_links.get()}
         try: CONFIG_FILE.write_text(json.dumps(cfg,indent=2), encoding="utf-8")
         except Exception: pass
 
@@ -3976,6 +4589,10 @@ class ConverterApp(tk.Tk):
                 self.css_label.config(text=f"✅  {Path(css_path).name}", fg=SUCCESS)
             self._last_preset_name=cfg.get("last_preset","")
             self._youtube_api_key=cfg.get("youtube_api_key","")
+            self._p_strip_brackets.set(cfg.get("p_strip_brackets", False))
+            self._p_include_attach.set(cfg.get("p_include_attach", True))
+            self._p_import_course_name.set(cfg.get("p_import_course_name", False))
+            self._p_validate_links.set(cfg.get("p_validate_links", False))
         except Exception: self._last_preset_name=""
 
 
